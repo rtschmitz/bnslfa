@@ -47,6 +47,13 @@ import os
 import sqlite3
 import unicodedata
 
+import argparse
+import re
+import time
+import requests
+from flask import send_file
+
+
 from flask import Flask, request, jsonify, session, redirect, url_for, render_template_string, abort
 
 APP_DIR = Path(__file__).resolve().parent
@@ -60,6 +67,25 @@ else:
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 FREE_AGENTS_CSV = APP_DIR / "free_agents.csv"
+PLAYER_REGISTRY_CSV = APP_DIR / "player_registry.csv"  # your new registry file
+HEADSHOT_DIR = APP_DIR / "static" / "player_images"
+HEADSHOT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Map franchise abbreviations -> your full MLB_TEAMS strings.
+# Add more as needed (this covers your examples).
+ABBR_TO_TEAM = {
+    "ARI":"Arizona Diamondbacks","ATL":"Atlanta Braves","BAL":"Baltimore Orioles","BOS":"Boston Red Sox",
+    "CHC":"Chicago Cubs","CHW":"Chicago White Sox","CIN":"Cincinnati Reds","CLE":"Cleveland Guardians",
+    "COL":"Colorado Rockies","DET":"Detroit Tigers","HOU":"Houston Astros","KCR":"Kansas City Royals",
+    "LAA":"Los Angeles Angels","LAD":"Los Angeles Dodgers","MIA":"Miami Marlins","MIL":"Milwaukee Brewers",
+    "MIN":"Minnesota Twins","NYM":"New York Mets","NYY":"New York Yankees","OAK":"Oakland Athletics",
+    "PHI":"Philadelphia Phillies","PIT":"Pittsburgh Pirates","SDP":"San Diego Padres","SFG":"San Francisco Giants",
+    "SEA":"Seattle Mariners","STL":"St. Louis Cardinals","TBR":"Tampa Bay Rays","TEX":"Texas Rangers",
+    "TOR":"Toronto Blue Jays","WSN":"Washington Nationals",
+}
+
+
+
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "bnsl-fasecretkey")
@@ -116,6 +142,19 @@ TEAM_EMAILS = {
 }
 
 # ---------- Helpers ----------
+def ensure_column(conn: sqlite3.Connection, table: str, col: str, coldef: str):
+    """
+    Add a column if it doesn't already exist.
+    coldef example: "mlbam_id INTEGER"
+    """
+    cur = conn.cursor()
+    cur.execute(f"PRAGMA table_info({table})")
+    cols = {r[1] for r in cur.fetchall()}  # (cid, name, type, notnull, dflt, pk)
+    if col not in cols:
+        cur.execute(f"ALTER TABLE {table} ADD COLUMN {coldef}")
+        conn.commit()
+
+
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -239,6 +278,28 @@ def init_db():
         )
     """)
 
+    # --- add registry columns to free_agents if missing ---
+    ensure_column(conn, "free_agents", "mlbam_id", "mlbam_id INTEGER")
+    ensure_column(conn, "free_agents", "fangraphs_id", "fangraphs_id INTEGER")
+    ensure_column(conn, "free_agents", "fg_url", "fg_url TEXT")
+    ensure_column(conn, "free_agents", "franchise_abbr", "franchise_abbr TEXT")
+    ensure_column(conn, "free_agents", "htd", "htd INTEGER")  # mirror of HTD (0/1/2)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS player_meta (
+            mlbam_id INTEGER PRIMARY KEY,
+            full_name TEXT,
+            bats TEXT,
+            throws TEXT,
+            birth_date TEXT,
+            height TEXT,
+            weight INTEGER,
+            headshot_local TEXT,
+            updated_at TEXT
+        )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS free_agents_mlbam_idx ON free_agents(mlbam_id)")
+
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS bids (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -282,6 +343,152 @@ def db_is_empty() -> bool:
     n = int(cur.fetchone()[0] or 0)
     conn.close()
     return n == 0
+
+def _clean_int(x: str, default: int = 0) -> int:
+    try:
+        return int(str(x).strip())
+    except Exception:
+        return default
+
+def _clean_text(x: str) -> str:
+    return (x or "").strip()
+
+def import_player_registry_csv(path: Path):
+    """
+    Expected headers (case-insensitive):
+      player,FG_URL,position,fangraphs_id,mlbam_id,franchise_abbr,HTD
+    """
+    if not path.exists():
+        return
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    with path.open(newline="", encoding="utf-8") as f:
+        r = csv.DictReader(f)
+        for row in r:
+            # tolerate header case differences
+            name = _clean_text(row.get("player") or row.get("Player") or row.get("name") or row.get("Name"))
+            if not name:
+                continue
+
+            fg_url = _clean_text(row.get("FG_URL") or row.get("fg_url") or row.get("Fg_Url") or row.get("url") or row.get("URL"))
+            pos = _clean_text(row.get("position") or row.get("Position"))
+            fg_id = _clean_int(row.get("fangraphs_id") or row.get("FanGraphs_ID") or row.get("FG_ID") or 0, 0)
+            mlbam_id = _clean_int(row.get("mlbam_id") or row.get("MLBAM_ID") or 0, 0)
+            abbr = _clean_text(row.get("franchise_abbr") or row.get("Franchise_Abbr") or "").upper()
+            htd = clamp_int(row.get("HTD") or row.get("htd") or 0, 0, 2, 0)
+
+            # Map hometown franchise abbr -> full team name
+            hometown_team = ABBR_TO_TEAM.get(abbr, "")
+
+            # Your existing hometown logic uses hometown_seasons (0/1/2) -> 0/5/10%
+            hometown_seasons = htd
+
+            # Prefer to upsert by mlbam_id if present, else by fangraphs_id
+            existing_id = None
+            if mlbam_id > 0:
+                cur.execute("SELECT id FROM free_agents WHERE mlbam_id=?", (mlbam_id,))
+                x = cur.fetchone()
+                existing_id = int(x["id"]) if x else None
+
+            if existing_id is None and fg_id > 0:
+                cur.execute("SELECT id FROM free_agents WHERE fangraphs_id=?", (fg_id,))
+                x = cur.fetchone()
+                existing_id = int(x["id"]) if x else None
+
+            if existing_id is None:
+                # 11 columns => 11 placeholders => 11 values
+                cur.execute("""
+                    INSERT INTO free_agents(
+                      name, position, last_team, hometown_team, hometown_seasons, seed_qo,
+                      mlbam_id, fangraphs_id, fg_url, franchise_abbr, htd
+                    )
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                """, (
+                    name,
+                    pos,
+                    "",                      # last_team
+                    hometown_team,
+                    hometown_seasons,
+                    0,                       # seed_qo
+                    (mlbam_id if mlbam_id > 0 else None),
+                    (fg_id if fg_id > 0 else None),
+                    (fg_url or None),
+                    (abbr or None),
+                    htd,
+                ))
+            else:
+                cur.execute("""
+                    UPDATE free_agents
+                    SET name=?,
+                        position=?,
+                        hometown_team=?,
+                        hometown_seasons=?,
+                        mlbam_id=COALESCE(?, mlbam_id),
+                        fangraphs_id=COALESCE(?, fangraphs_id),
+                        fg_url=COALESCE(?, fg_url),
+                        franchise_abbr=COALESCE(?, franchise_abbr),
+                        htd=COALESCE(?, htd)
+                    WHERE id=?
+                """, (
+                    name,
+                    pos,
+                    hometown_team,
+                    hometown_seasons,
+                    (mlbam_id if mlbam_id > 0 else None),
+                    (fg_id if fg_id > 0 else None),
+                    (fg_url or None),
+                    (abbr or None),
+                    htd,
+                    existing_id
+                ))
+
+    conn.commit()
+    conn.close()
+
+
+
+def mlb_headshot_url(mlbam_id: int) -> str:
+    # Widely used pattern (works for most modern players)
+    return (
+        "https://img.mlbstatic.com/mlb-photos/image/upload/"
+        "w_213,d_people:generic:headshot:silo:current.png,q_auto:best,f_auto/"
+        f"v1/people/{mlbam_id}/headshot/67/current"
+    )
+
+def legacy_headshot_url(mlbam_id: int) -> str:
+    # Older endpoint that redirects to current location
+    return f"https://securea.mlb.com/mlb/images/players/head_shot/{mlbam_id}.jpg"
+
+def ensure_headshot_cached(mlbam_id: int) -> str | None:
+    """
+    Returns local filesystem path string if cached/created, else None.
+    """
+    if mlbam_id <= 0:
+        return None
+
+    out = HEADSHOT_DIR / f"{mlbam_id}.png"
+    if out.exists() and out.stat().st_size > 1024:
+        return str(out)
+
+    sess = requests.Session()
+    headers = {"User-Agent": "Mozilla/5.0"}
+
+    # Try primary URL
+    for url in (mlb_headshot_url(mlbam_id), legacy_headshot_url(mlbam_id)):
+        try:
+            r = sess.get(url, headers=headers, timeout=20, allow_redirects=True)
+            if r.status_code == 200 and r.content and len(r.content) > 1024:
+                # If it's jpg from legacy, still save as .png filename is fine for browsers if content-type differs,
+                # but to be clean you can keep .jpg; we keep .png just for uniformity.
+                out.write_bytes(r.content)
+                return str(out)
+        except Exception:
+            pass
+
+    return None
+
 
 def generate_sample_free_agents_csv(path: Path):
     if path.exists():
@@ -437,12 +644,13 @@ def player_snapshot_row(p: sqlite3.Row) -> Dict[str, Any]:
     pid = int(p["id"])
     leader = get_current_leader(pid)
 
-    cur_val = float(leader["bid_value_m"]) if leader else None
-    cur_team = leader["team"] if leader else None
-    expires_at = leader["expires_at"] if leader else None
+    mlbam_id = int(p["mlbam_id"] or 0) if "mlbam_id" in p.keys() else 0
 
     return {
         "id": pid,
+        "mlbam_id": mlbam_id,
+        "fg_url": p["fg_url"] if "fg_url" in p.keys() else None,
+
         "name": p["name"],
         "position": p["position"],
         "last_team": p["last_team"],
@@ -450,9 +658,9 @@ def player_snapshot_row(p: sqlite3.Row) -> Dict[str, Any]:
         "hometown_seasons": int(p["hometown_seasons"] or 0),
         "signed_team": p["signed_team"],
         "signed_at": p["signed_at"],
-        "current_bid_value_m": cur_val,
-        "current_bid_team": cur_team,
-        "expires_at": expires_at,
+        "current_bid_value_m": float(leader["bid_value_m"]) if leader else None,
+        "current_bid_team": leader["team"] if leader else None,
+        "expires_at": leader["expires_at"] if leader else None,
     }
 
 def fetch_free_agents(search: str = "", hide_signed: bool = False) -> List[Dict[str, Any]]:
@@ -631,10 +839,17 @@ def place_bid(team: str, pid: int, years: int, has_option: bool, aav_m: float) -
 
 # ---------- Startup ----------
 init_db()
-generate_sample_free_agents_csv(FREE_AGENTS_CSV)
-if db_is_empty():
-    import_free_agents_csv(FREE_AGENTS_CSV)
+
+# If you have a real registry, prefer it.
+if db_is_empty() and PLAYER_REGISTRY_CSV.exists():
+    import_player_registry_csv(PLAYER_REGISTRY_CSV)
+else:
+    generate_sample_free_agents_csv(FREE_AGENTS_CSV)
+    if db_is_empty():
+        import_free_agents_csv(FREE_AGENTS_CSV)
+
 seed_qualifying_offers(qo_aav_m=21.2)
+
 
 
 # ---------- UI (templates) ----------
@@ -655,6 +870,10 @@ BASE_STYLE = """
   .signed { opacity: 0.55; }
   .danger { color:#b00020; font-weight:600; }
   .green { color:#0a7a0a; font-weight:600; }
+  .pimg { width: 28px; height: 28px; border-radius: 8px; object-fit: cover; border: 1px solid #eee; margin-right: 8px; vertical-align: middle; }
+  .pname { display:flex; align-items:center; gap:8px; }
+  .pname a, a .pname { color: inherit; text-decoration: none; }
+  a:hover .pname b { text-decoration: underline; }
 
   dialog { border: 1px solid #ddd; border-radius: 12px; padding: 0; width: min(720px, 94vw); }
   dialog::backdrop { background: rgba(0,0,0,0.35); }
@@ -855,6 +1074,8 @@ function renderPlayers() {{
   for (const p of state.players) {{
     const tr = document.createElement('tr');
     tr.className = 'row-hover' + (p.signed_team ? ' signed' : '');
+    const img = p.mlbam_id ? `/player_image/${{p.mlbam_id}}.png` : '';
+    const imgTag = p.mlbam_id ? `<img class="pimg" src="${{img}}" loading="lazy" />` : '';
 
     const leader = p.current_bid_team ? p.current_bid_team : '—';
     const val = p.current_bid_value_m !== null ? moneyM(p.current_bid_value_m) : '—';
@@ -892,14 +1113,23 @@ function renderPlayers() {{
     actionTd.appendChild(document.createTextNode(' '));
     actionTd.appendChild(wBtn);
 
-    tr.innerHTML = `
-      <td><b>${{p.name}}</b><div class="muted" style="font-size:12px;">Hometown: ${{p.hometown_team || '—'}}</div></td>
-      <td>${{p.position || '—'}}</td>
-      <td>${{leader}}</td>
-      <td>${{val}}</td>
-      <td>${{exp}}</td>
-      <td>${{status}}</td>
-    `;
+const linkOpen = p.fg_url ? `<a href="${{p.fg_url}}" target="_blank" rel="noopener noreferrer">` : '';
+const linkClose = p.fg_url ? `</a>` : '';
+
+tr.innerHTML = `
+  <td>
+    ${{linkOpen}}
+      <div class="pname">${{imgTag}}<b>${{p.name}}</b></div>
+    ${{linkClose}}
+    <div class="muted" style="font-size:12px;">Hometown: ${{p.hometown_team || '—'}}</div>
+  </td>
+  <td>${{p.position || '—'}}</td>
+  <td>${{leader}}</td>
+  <td>${{val}}</td>
+  <td>${{exp}}</td>
+  <td>${{status}}</td>
+`;
+
     tr.appendChild(actionTd);
     faBody.appendChild(tr);
   }}
@@ -1202,6 +1432,8 @@ function render() {{
     const val = p.current_bid_value_m !== null ? moneyM(p.current_bid_value_m) : '—';
     const exp = p.expires_at ? fmtIso(p.expires_at) : '—';
     const status = p.signed_team ? `Signed: ${{p.signed_team}}` : (p.current_bid_team ? 'Bidding open' : 'No bids');
+    const img = p.mlbam_id ? `/player_image/${{p.mlbam_id}}.png` : '';
+    const imgTag = p.mlbam_id ? `<img class="pimg" src="${{img}}" loading="lazy" />` : '';
 
     const actionTd = document.createElement('td');
 
@@ -1231,14 +1463,24 @@ function render() {{
     actionTd.appendChild(document.createTextNode(' '));
     actionTd.appendChild(rmBtn);
 
-    tr.innerHTML = `
-      <td><b>${{p.name}}</b><div class="muted" style="font-size:12px;">Hometown: ${{p.hometown_team || '—'}}</div></td>
-      <td>${{p.position || '—'}}</td>
-      <td>${{leader}}</td>
-      <td>${{val}}</td>
-      <td>${{exp}}</td>
-      <td>${{status}}</td>
-    `;
+const linkOpen = p.fg_url ? `<a href="${{p.fg_url}}" target="_blank" rel="noopener noreferrer">` : '';
+const linkClose = p.fg_url ? `</a>` : '';
+
+tr.innerHTML = `
+  <td>
+    ${{linkOpen}}
+      <div class="pname">${{imgTag}}<b>${{p.name}}</b></div>
+    ${{linkClose}}
+    <div class="muted" style="font-size:12px;">Hometown: ${{p.hometown_team || '—'}}</div>
+  </td>
+  <td>${{p.position || '—'}}</td>
+  <td>${{leader}}</td>
+  <td>${{val}}</td>
+  <td>${{exp}}</td>
+  <td>${{status}}</td>
+`;
+
+
     tr.appendChild(actionTd);
     wlBody.appendChild(tr);
   }}
@@ -1550,6 +1792,16 @@ def api_free_agents():
 
     return jsonify({"players": players})
 
+@app.get("/player_image/<int:mlbam_id>.png")
+def player_image(mlbam_id: int):
+    # cache it
+    local = ensure_headshot_cached(mlbam_id)
+    if not local:
+        abort(404)
+
+    return send_file(local, mimetype="image/png")
+
+
 @app.get("/api/watchlist")
 def api_watchlist_get():
     team = _require_authed_team()
@@ -1667,8 +1919,30 @@ def task_enforce_expirations():
 def healthz():
     return {"ok": True}
 
-
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "5000"))  # Render sets PORT
-    app.run(host="0.0.0.0", port=port, debug=False)  # bind to all interfaces
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--sync-registry", action="store_true", help="Import/refresh players from player_registry.csv into DB")
+    ap.add_argument("--prefetch-headshots", action="store_true", help="Download headshots for all players with mlbam_id")
+    args = ap.parse_args()
+
+    if args.sync_registry:
+        import_player_registry_csv(PLAYER_REGISTRY_CSV)
+        print("✅ Registry synced.")
+        if args.prefetch_headshots:
+            conn = get_conn()
+            cur = conn.cursor()
+            cur.execute("SELECT DISTINCT mlbam_id FROM free_agents WHERE mlbam_id IS NOT NULL")
+            ids = [int(r[0]) for r in cur.fetchall() if r[0]]
+            conn.close()
+
+            for i, mid in enumerate(ids, 1):
+                ensure_headshot_cached(mid)
+                if i % 50 == 0:
+                    print(f"... {i}/{len(ids)}")
+                time.sleep(0.15)  # polite
+            print("✅ Headshots prefetched.")
+        raise SystemExit(0)
+
+    port = int(os.environ.get("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port, debug=False)
 
