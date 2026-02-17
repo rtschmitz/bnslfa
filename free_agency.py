@@ -191,14 +191,14 @@ def min_aav_millions(years: int, has_option: bool) -> float:
     Minimum salary rules (AAV), in $M.
     Map by total years where option adds one potential year.
     """
-    total = years + (1 if has_option else 0)
+    total = min(6, years + (2 if has_option else 0))
     mins = {
         1: 0.75,
-        2: 0.90,
-        3: 1.25,
-        4: 2.50,
-        5: 3.50,
-        6: 5.00,
+        2: 1.25,
+        3: 2.50,
+        4: 5.00,
+        5: 7.00,
+        6: 10.00,
     }
     return float(mins.get(total, 999999.0))
 
@@ -1121,7 +1121,7 @@ tr.innerHTML = `
     ${{linkOpen}}
       <div class="pname">${{imgTag}}<b>${{p.name}}</b></div>
     ${{linkClose}}
-    <div class="muted" style="font-size:12px;">Hometown: ${{p.hometown_team || '—'}}</div>
+    <div class="muted" style="font-size:12px;">Hometown Discount: ${{p.hometown_team || '—'}}</div>
   </td>
   <td>${{p.position || '—'}}</td>
   <td>${{leader}}</td>
@@ -1471,7 +1471,7 @@ tr.innerHTML = `
     ${{linkOpen}}
       <div class="pname">${{imgTag}}<b>${{p.name}}</b></div>
     ${{linkClose}}
-    <div class="muted" style="font-size:12px;">Hometown: ${{p.hometown_team || '—'}}</div>
+    <div class="muted" style="font-size:12px;">Hometown Discount: ${{p.hometown_team || '—'}}</div>
   </td>
   <td>${{p.position || '—'}}</td>
   <td>${{leader}}</td>
